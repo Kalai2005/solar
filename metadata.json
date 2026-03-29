@@ -1,0 +1,5 @@
+{
+  "name": "SolarGuard: Panel Defect Detector",
+  "description": "AI-powered solar panel inspection tool that detects cracks, dust, and hotspots using your phone camera.",
+  "requestFramePermissions": ["camera"]
+}
