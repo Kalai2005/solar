@@ -46,7 +46,26 @@ interface AnalysisResult {
 
 const getGeminiApiKey = () => {
   const viteEnv = import.meta.env as Record<string, string | undefined>;
-  return viteEnv.VITE_GEMINI_API_KEY || viteEnv.GEMINI_API_KEY;
+  const processEnv =
+    typeof process !== "undefined"
+      ? (process.env as Record<string, string | undefined>)
+      : {};
+
+  const candidates = [
+    viteEnv.VITE_GEMINI_API_KEY,
+    viteEnv.GEMINI_API_KEY,
+    processEnv.VITE_GEMINI_API_KEY,
+    processEnv.GEMINI_API_KEY,
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const normalized = candidate.trim();
+    if (!normalized || normalized.toLowerCase() === "undefined") continue;
+    return normalized;
+  }
+
+  return undefined;
 };
 
 const getPreferredGeminiModels = () => {
@@ -63,6 +82,32 @@ const getPreferredGeminiModels = () => {
 };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const RESULT_CACHE_KEY = "solarguard_result_cache_v1";
+
+const getImageFingerprint = (base64Image: string) => {
+  const imageData = base64Image.split(",")[1] || base64Image;
+  let hash = 0;
+  for (let i = 0; i < imageData.length; i++) {
+    hash = (hash * 31 + imageData.charCodeAt(i)) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
+};
+
+const readResultCache = (): Record<string, AnalysisResult> => {
+  try {
+    const raw = localStorage.getItem(RESULT_CACHE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, AnalysisResult>;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+};
+
+const writeResultCache = (cache: Record<string, AnalysisResult>) => {
+  localStorage.setItem(RESULT_CACHE_KEY, JSON.stringify(cache));
+};
 
 const isTransientGeminiError = (err: unknown) => {
   if (!(err instanceof Error)) return false;
@@ -127,6 +172,7 @@ const analyzePanel = async (base64Image: string): Promise<AnalysisResult> => {
             ],
           },
           config: {
+            temperature: 0,
             responseMimeType: "application/json",
             responseSchema: {
               type: Type.OBJECT,
@@ -282,12 +328,25 @@ export default function App() {
     setIsAnalyzing(true);
     setError(null);
     try {
+      const imageKey = getImageFingerprint(capturedImage);
+      const cached = readResultCache()[imageKey];
+      if (cached) {
+        setResult(cached);
+        setHistory((prev) => [{ ...cached, image: capturedImage }, ...prev]);
+        return;
+      }
+
       const analysis = await analyzePanel(capturedImage);
       const resultWithTime = { 
         ...analysis, 
         id: crypto.randomUUID(),
         timestamp: new Date().toLocaleTimeString() 
       };
+
+      const cache = readResultCache();
+      cache[imageKey] = resultWithTime;
+      writeResultCache(cache);
+
       setResult(resultWithTime);
       setHistory((prev) => [{ ...resultWithTime, image: capturedImage }, ...prev]);
     } catch (err) {
