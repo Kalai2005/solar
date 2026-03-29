@@ -49,6 +49,33 @@ const getGeminiApiKey = () => {
   return viteEnv.VITE_GEMINI_API_KEY || viteEnv.GEMINI_API_KEY;
 };
 
+const getPreferredGeminiModels = () => {
+  const viteEnv = import.meta.env as Record<string, string | undefined>;
+  const customModel = viteEnv.VITE_GEMINI_MODEL || viteEnv.GEMINI_MODEL;
+
+  // Prefer user-specified model, then try stable/fast options before preview.
+  return [
+    customModel,
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-3-flash-preview",
+  ].filter((model): model is string => Boolean(model));
+};
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const isTransientGeminiError = (err: unknown) => {
+  if (!(err instanceof Error)) return false;
+  const message = err.message.toLowerCase();
+  return (
+    message.includes("503") ||
+    message.includes("unavailable") ||
+    message.includes("high demand") ||
+    message.includes("resource_exhausted") ||
+    message.includes("overloaded")
+  );
+};
+
 const analyzePanel = async (base64Image: string): Promise<AnalysisResult> => {
   const apiKey = getGeminiApiKey();
   if (!apiKey) {
@@ -59,68 +86,101 @@ const analyzePanel = async (base64Image: string): Promise<AnalysisResult> => {
   }
 
   const ai = new GoogleGenAI({ apiKey });
-  const response = await ai.models.generateContent({
-    model: "gemini-3-flash-preview",
-    contents: {
-      parts: [
-        {
-          inlineData: {
-            mimeType: "image/jpeg",
-            data: base64Image.split(",")[1],
-          },
-        },
-        {
-          text: `You are a professional solar panel inspection expert. Analyze this image of a solar panel for defects.
-          Identify: Cracks (micro or macro), Dust/Soiling, Hotspots (if visible or inferred), Shading (from trees/structures), Bird droppings, or Corrosion.
-          
-          Return a JSON object with the following structure:
-          {
-            "panel_health_score": number (0-100, where 100 is perfect),
-            "defects": [
+  const modelsToTry = getPreferredGeminiModels();
+  let lastError: unknown = null;
+
+  for (const model of modelsToTry) {
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const response = await ai.models.generateContent({
+          model,
+          contents: {
+            parts: [
               {
-                "type": "crack" | "dust" | "hotspot" | "shading" | "bird_dropping" | "corrosion" | "none",
-                "severity": "low" | "medium" | "high" | "critical",
-                "confidence": number (0-1),
-                "description": "Short description of the defect",
-                "recommendation": "What should the maintenance team do?",
-                "location_on_panel": "e.g., Top left corner, center, etc."
-              }
+                inlineData: {
+                  mimeType: "image/jpeg",
+                  data: base64Image.split(",")[1],
+                },
+              },
+              {
+                text: `You are a professional solar panel inspection expert. Analyze this image of a solar panel for defects.
+                Identify: Cracks (micro or macro), Dust/Soiling, Hotspots (if visible or inferred), Shading (from trees/structures), Bird droppings, or Corrosion.
+                
+                Return a JSON object with the following structure:
+                {
+                  "panel_health_score": number (0-100, where 100 is perfect),
+                  "defects": [
+                    {
+                      "type": "crack" | "dust" | "hotspot" | "shading" | "bird_dropping" | "corrosion" | "none",
+                      "severity": "low" | "medium" | "high" | "critical",
+                      "confidence": number (0-1),
+                      "description": "Short description of the defect",
+                      "recommendation": "What should the maintenance team do?",
+                      "location_on_panel": "e.g., Top left corner, center, etc."
+                    }
+                  ],
+                  "summary": "A brief overall summary of the panel condition"
+                }
+                If no defects are found, return an empty defects array and a high health score.`,
+              },
             ],
-            "summary": "A brief overall summary of the panel condition"
-          }
-          If no defects are found, return an empty defects array and a high health score.`,
-        },
-      ],
-    },
-    config: {
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          panel_health_score: { type: Type.NUMBER },
-          summary: { type: Type.STRING },
-          defects: {
-            type: Type.ARRAY,
-            items: {
+          },
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
               type: Type.OBJECT,
               properties: {
-                type: { type: Type.STRING },
-                severity: { type: Type.STRING },
-                confidence: { type: Type.NUMBER },
-                description: { type: Type.STRING },
-                recommendation: { type: Type.STRING },
-                location_on_panel: { type: Type.STRING },
+                panel_health_score: { type: Type.NUMBER },
+                summary: { type: Type.STRING },
+                defects: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      type: { type: Type.STRING },
+                      severity: { type: Type.STRING },
+                      confidence: { type: Type.NUMBER },
+                      description: { type: Type.STRING },
+                      recommendation: { type: Type.STRING },
+                      location_on_panel: { type: Type.STRING },
+                    },
+                    required: ["type", "severity", "confidence", "description", "recommendation"],
+                  },
+                },
               },
-              required: ["type", "severity", "confidence", "description", "recommendation"],
+              required: ["panel_health_score", "defects", "summary"],
             },
           },
-        },
-        required: ["panel_health_score", "defects", "summary"],
-      },
-    },
-  });
+        });
 
-  return JSON.parse(response.text || "{}") as AnalysisResult;
+        return JSON.parse(response.text || "{}") as AnalysisResult;
+      } catch (err) {
+        lastError = err;
+        const canRetry = isTransientGeminiError(err) && attempt < maxAttempts;
+        if (canRetry) {
+          const backoffMs = 600 * 2 ** (attempt - 1);
+          await sleep(backoffMs);
+          continue;
+        }
+
+        // Move to the next fallback model on transient outages.
+        if (isTransientGeminiError(err)) {
+          break;
+        }
+
+        throw err;
+      }
+    }
+  }
+
+  if (lastError instanceof Error && isTransientGeminiError(lastError)) {
+    throw new Error(
+      "Gemini is temporarily overloaded (503 high demand). Please try again in a few seconds."
+    );
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("Analysis failed unexpectedly.");
 };
 
 // --- Components ---
@@ -131,6 +191,7 @@ export default function App() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [expandedHistoryId, setExpandedHistoryId] = useState<string | null>(null);
   const [history, setHistory] = useState<(AnalysisResult & { image: string })[]>(() => {
     const saved = localStorage.getItem("solarguard_history");
     return saved ? JSON.parse(saved) : [];
@@ -251,6 +312,7 @@ export default function App() {
 
   const clearAllHistory = () => {
     setHistory([]);
+    setExpandedHistoryId(null);
   };
 
   const getSeverityColor = (severity: string) => {
@@ -501,26 +563,75 @@ export default function App() {
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, scale: 0.95 }}
                     key={item.id} 
-                    className="bg-white p-4 rounded-3xl border border-gray-100 shadow-sm flex gap-4 items-center group relative"
+                    className="bg-white p-4 rounded-3xl border border-gray-100 shadow-sm group relative"
                   >
-                    <img src={item.image} className="w-24 h-24 rounded-2xl object-cover shrink-0" alt="History" />
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center justify-between mb-1">
-                        <span className="text-xs font-bold text-gray-400">{item.timestamp}</span>
-                        <span className={`text-lg font-black ${getHealthColor(item.panel_health_score)}`}>{item.panel_health_score}%</span>
+                    <div className="flex gap-4 items-start">
+                      <img src={item.image} className="w-24 h-24 rounded-2xl object-cover shrink-0" alt="History" />
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="text-xs font-bold text-gray-400">{item.timestamp}</span>
+                          <span className={`text-lg font-black ${getHealthColor(item.panel_health_score)}`}>{item.panel_health_score}%</span>
+                        </div>
+                        <p className="text-sm font-bold truncate">{item.summary}</p>
+                        <div className="mt-2 flex items-center gap-2 flex-wrap">
+                          <p className="text-xs text-gray-500">
+                            {item.defects.length} {item.defects.length === 1 ? "defect" : "defects"} identified
+                          </p>
+                          {item.defects.length > 0 ? (
+                            item.defects.slice(0, 3).map((defect, defectIdx) => (
+                              <span
+                                key={`${item.id}-chip-${defectIdx}`}
+                                className={`px-2 py-1 rounded-full text-[10px] font-bold uppercase tracking-wide border ${getSeverityColor(defect.severity)}`}
+                              >
+                                {defect.type.replace("_", " ")}
+                              </span>
+                            ))
+                          ) : (
+                            <span className="px-2 py-1 rounded-full text-[10px] font-bold uppercase tracking-wide border text-emerald-700 bg-emerald-50 border-emerald-200">
+                              no defects
+                            </span>
+                          )}
+                        </div>
                       </div>
-                      <p className="text-sm font-bold truncate">{item.summary}</p>
-                      <p className="text-xs text-gray-500 mt-1">
-                        {item.defects.length} {item.defects.length === 1 ? "defect" : "defects"} identified
-                      </p>
+                      <div className="flex items-start gap-1">
+                        {item.defects.length > 0 && (
+                          <button
+                            onClick={() => setExpandedHistoryId(prev => (prev === item.id ? null : item.id))}
+                            className="px-3 py-1.5 text-xs font-bold text-emerald-700 hover:text-emerald-800 bg-emerald-50 hover:bg-emerald-100 rounded-full transition-colors"
+                          >
+                            {expandedHistoryId === item.id ? "Hide Problems" : "View Problems"}
+                          </button>
+                        )}
+                        <button 
+                          onClick={() => deleteHistoryItem(item.id)}
+                          className="p-2 text-gray-300 hover:text-red-500 transition-colors"
+                          title="Delete entry"
+                        >
+                          <Trash2 className="w-5 h-5" />
+                        </button>
+                      </div>
                     </div>
-                    <button 
-                      onClick={() => deleteHistoryItem(item.id)}
-                      className="p-2 text-gray-300 hover:text-red-500 transition-colors"
-                      title="Delete entry"
-                    >
-                      <Trash2 className="w-5 h-5" />
-                    </button>
+
+                    {expandedHistoryId === item.id && item.defects.length > 0 && (
+                      <div className="mt-4 pt-4 border-t border-gray-100 space-y-3">
+                        <p className="text-xs font-bold uppercase tracking-wider text-gray-400">Detected Problems</p>
+                        {item.defects.map((defect, defectIdx) => (
+                          <div key={`${item.id}-problem-${defectIdx}`} className="rounded-2xl border border-gray-100 bg-gray-50 p-3">
+                            <div className="flex items-center justify-between gap-2">
+                              <p className="text-sm font-bold capitalize text-gray-800">{defect.type.replace("_", " ")}</p>
+                              <span className={`px-2 py-1 rounded-full text-[10px] font-bold uppercase tracking-wide border ${getSeverityColor(defect.severity)}`}>
+                                {defect.severity}
+                              </span>
+                            </div>
+                            <p className="text-xs text-gray-600 mt-2">{defect.description}</p>
+                            <p className="text-xs text-emerald-700 mt-2"><span className="font-semibold">Recommendation:</span> {defect.recommendation}</p>
+                            {defect.location_on_panel && (
+                              <p className="text-[11px] text-gray-500 mt-2">Location: {defect.location_on_panel}</p>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </motion.div>
                 ))}
               </div>
