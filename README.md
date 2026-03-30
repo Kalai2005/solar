@@ -18,3 +18,12 @@ View your app in AI Studio: https://ai.studio/apps/6b7f0b7f-4185-4a34-91ce-fbf2d
 2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
 3. Run the app:
    `npm run dev`
+
+## Mobile camera over HTTPS (recommended)
+
+Most phone browsers require HTTPS for camera access on non-localhost URLs.
+
+1. Add `VITE_DEV_HTTPS="true"` to `.env.local` (or create `.env.https.local`).
+2. Start the app with HTTPS enabled:
+   `npm run dev:https`
+3. Open the HTTPS network URL on your phone and accept the local certificate warning once.

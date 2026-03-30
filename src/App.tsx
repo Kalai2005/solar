@@ -19,9 +19,15 @@ import {
   Wind,
   Image as ImageIcon,
   Trash2,
-  Upload
+  Upload,
+  QrCode,
+  Smartphone,
+  Link as LinkIcon,
+  Copy,
+  Check
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
+import QRCode from "qrcode";
 
 // --- Types ---
 
@@ -84,6 +90,9 @@ const getPreferredGeminiModels = () => {
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const RESULT_CACHE_KEY = "solarguard_result_cache_v1";
+const RELAY_POLL_MS = 2200;
+
+const createRelaySessionId = () => crypto.randomUUID().split("-")[0];
 
 const getImageFingerprint = (base64Image: string) => {
   const imageData = base64Image.split(",")[1] || base64Image;
@@ -119,6 +128,24 @@ const isTransientGeminiError = (err: unknown) => {
     message.includes("resource_exhausted") ||
     message.includes("overloaded")
   );
+};
+
+const getCameraAccessErrorMessage = (err: unknown) => {
+  if (err instanceof DOMException) {
+    if (err.name === "NotAllowedError" || err.name === "SecurityError") {
+      return "Camera permission was blocked. Allow camera access in your browser settings and reload this page.";
+    }
+
+    if (err.name === "NotFoundError" || err.name === "OverconstrainedError") {
+      return "No compatible camera was found on this phone. Try switching browser or use photo upload.";
+    }
+
+    if (err.name === "NotReadableError") {
+      return "Camera is being used by another app. Close other camera apps and try again.";
+    }
+  }
+
+  return "Unable to access camera. Please ensure permissions are granted.";
 };
 
 const analyzePanel = async (base64Image: string): Promise<AnalysisResult> => {
@@ -243,48 +270,188 @@ export default function App() {
     return saved ? JSON.parse(saved) : [];
   });
   const [view, setView] = useState<"camera" | "history">("camera");
+  const [mobileAccessUrl, setMobileAccessUrl] = useState("");
+  const [qrCodeDataUrl, setQrCodeDataUrl] = useState<string | null>(null);
+  const [copiedMobileUrl, setCopiedMobileUrl] = useState(false);
+  const [uploadedFileName, setUploadedFileName] = useState<string | null>(null);
+  const [relayNotice, setRelayNotice] = useState<string>("");
+  const [isSendingToRelay, setIsSendingToRelay] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const relaySessionIdRef = useRef<string>(createRelaySessionId());
+  const streamRef = useRef<MediaStream | null>(null);
+
+  const isMobileDevice = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+  const isLocalhost = /^(localhost|127\.0\.0\.1)$/.test(window.location.hostname);
+  const isSecureCameraContext = window.isSecureContext || isLocalhost;
+  const suggestedHttpsUrl =
+    window.location.protocol === "http:"
+      ? `https://${window.location.host}${window.location.pathname}${window.location.search}${window.location.hash}`
+      : "";
+  const trimmedMobileAccessUrl = mobileAccessUrl.trim();
+  const hasMobileAccessUrl = Boolean(trimmedMobileAccessUrl);
+  const isHttpMobileAccessUrl = /^http:\/\//i.test(trimmedMobileAccessUrl);
+  const isHttpsMobileAccessUrl = /^https:\/\//i.test(trimmedMobileAccessUrl);
+  const searchParams = new URLSearchParams(window.location.search);
+  const relaySessionFromUrl = (searchParams.get("session") || "").trim();
+  const isMobileRelayClient = isMobileDevice && searchParams.get("mobile") === "1" && Boolean(relaySessionFromUrl);
 
   // Persistence
   useEffect(() => {
     localStorage.setItem("solarguard_history", JSON.stringify(history));
   }, [history]);
 
-  // Initialize Camera
-  const startCamera = async () => {
+  useEffect(() => {
+    const baseUrl = `${window.location.origin}${window.location.pathname}`;
+    if (!isMobileDevice) {
+      const relaySessionId = relaySessionIdRef.current;
+      const relayUrl = `${baseUrl}?mobile=1&session=${relaySessionId}`;
+      setMobileAccessUrl(relayUrl);
+      setRelayNotice("Waiting for a photo from your phone...");
+      return;
+    }
+
+    setMobileAccessUrl(baseUrl);
+    if (isMobileRelayClient) {
+      setRelayNotice("Connected to desktop SolarGuard session. Capture and send a photo.");
+    }
+  }, [isMobileDevice, isMobileRelayClient]);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    const buildQrCode = async () => {
+      const trimmedUrl = mobileAccessUrl.trim();
+      if (!trimmedUrl) {
+        setQrCodeDataUrl(null);
+        return;
+      }
+
+      try {
+        const qrDataUrl = await QRCode.toDataURL(trimmedUrl, {
+          width: 240,
+          margin: 1,
+          errorCorrectionLevel: "M",
+        });
+        if (isMounted) {
+          setQrCodeDataUrl(qrDataUrl);
+        }
+      } catch {
+        if (isMounted) {
+          setQrCodeDataUrl(null);
+        }
+      }
+    };
+
+    buildQrCode();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [mobileAccessUrl]);
+
+  const stopCameraStream = useCallback(() => {
+    const current = streamRef.current;
+    if (!current) return;
+
+    current.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    setStream(null);
+  }, []);
+
+  // Initialize camera once per scan session and reuse the same stream.
+  const startCamera = useCallback(async () => {
+    if (!isMobileDevice) {
+      setError(null);
+      return;
+    }
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setError("Camera is not supported in this browser.");
+      return;
+    }
+
+    if (!isSecureCameraContext) {
+      setError("Mobile camera requires HTTPS (or localhost). Open SolarGuard using https:// or your local localhost URL.");
+      return;
+    }
+
+    const existing = streamRef.current;
+    if (existing && existing.active) {
+      if (videoRef.current && videoRef.current.srcObject !== existing) {
+        videoRef.current.srcObject = existing;
+      }
+      return;
+    }
+
     try {
-      const mediaStream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "environment" },
-        audio: false,
-      });
+      let mediaStream: MediaStream;
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: "environment" } },
+          audio: false,
+        });
+      } catch {
+        // Fallback for devices/browsers that reject facingMode constraints.
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: false,
+        });
+      }
+
+      streamRef.current = mediaStream;
       setStream(mediaStream);
       if (videoRef.current) {
         videoRef.current.srcObject = mediaStream;
+        try {
+          await videoRef.current.play();
+        } catch {
+          // Some mobile browsers defer autoplay until the user taps Start Camera.
+        }
       }
       setError(null);
     } catch (err) {
       console.error("Error accessing camera:", err);
-      setError("Unable to access camera. Please ensure permissions are granted.");
+      setError(getCameraAccessErrorMessage(err));
     }
-  };
+  }, [isMobileDevice, isSecureCameraContext]);
 
   useEffect(() => {
-    if (view === "camera") {
-      startCamera();
+    const shouldRunCamera = isMobileDevice && view === "camera" && !capturedImage;
+
+    if (shouldRunCamera) {
+      void startCamera();
+    } else {
+      stopCameraStream();
     }
+
     return () => {
-      if (stream) {
-        stream.getTracks().forEach((track) => track.stop());
-      }
+      stopCameraStream();
     };
-  }, [view]);
+  }, [capturedImage, isMobileDevice, startCamera, stopCameraStream, view]);
+
+  // Ensure an already-started stream is attached once the video element mounts.
+  useEffect(() => {
+    if (!stream || !videoRef.current) return;
+
+    if (videoRef.current.srcObject !== stream) {
+      videoRef.current.srcObject = stream;
+    }
+
+    void videoRef.current.play().catch(() => {
+      // Some browsers require user interaction before playback starts.
+    });
+  }, [stream]);
 
   const capturePhoto = () => {
     if (videoRef.current && canvasRef.current) {
       const video = videoRef.current;
       const canvas = canvasRef.current;
+      if (!video.videoWidth || !video.videoHeight) {
+        setError("Camera is not ready yet. Please wait a moment and try again.");
+        return;
+      }
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
       const ctx = canvas.getContext("2d");
@@ -293,10 +460,7 @@ export default function App() {
         const dataUrl = canvas.toDataURL("image/jpeg");
         setCapturedImage(dataUrl);
         // Stop stream to save battery
-        if (stream) {
-          stream.getTracks().forEach((track) => track.stop());
-          setStream(null);
-        }
+        stopCameraStream();
       }
     }
   };
@@ -304,13 +468,11 @@ export default function App() {
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
+      setUploadedFileName(file.name);
       const reader = new FileReader();
       reader.onloadend = () => {
         setCapturedImage(reader.result as string);
-        if (stream) {
-          stream.getTracks().forEach((track) => track.stop());
-          setStream(null);
-        }
+        stopCameraStream();
       };
       reader.readAsDataURL(file);
     }
@@ -320,7 +482,10 @@ export default function App() {
     setCapturedImage(null);
     setResult(null);
     setError(null);
-    startCamera();
+    setUploadedFileName(null);
+    if (isMobileDevice) {
+      void startCamera();
+    }
   };
 
   const runAnalysis = async () => {
@@ -333,6 +498,7 @@ export default function App() {
       if (cached) {
         setResult(cached);
         setHistory((prev) => [{ ...cached, image: capturedImage }, ...prev]);
+        setRelayNotice("Analysis complete.");
         return;
       }
 
@@ -349,6 +515,7 @@ export default function App() {
 
       setResult(resultWithTime);
       setHistory((prev) => [{ ...resultWithTime, image: capturedImage }, ...prev]);
+      setRelayNotice("Analysis complete.");
     } catch (err) {
       console.error("Analysis failed:", err);
       if (err instanceof Error) {
@@ -365,6 +532,105 @@ export default function App() {
     }
   };
 
+  const analyzeCapturedImage = useCallback(async (image: string) => {
+    setIsAnalyzing(true);
+    setError(null);
+    try {
+      const imageKey = getImageFingerprint(image);
+      const cached = readResultCache()[imageKey];
+      if (cached) {
+        setResult(cached);
+        setHistory((prev) => [{ ...cached, image }, ...prev]);
+        setRelayNotice("Analysis complete.");
+        return;
+      }
+
+      const analysis = await analyzePanel(image);
+      const resultWithTime = { 
+        ...analysis, 
+        id: crypto.randomUUID(),
+        timestamp: new Date().toLocaleTimeString() 
+      };
+
+      const cache = readResultCache();
+      cache[imageKey] = resultWithTime;
+      writeResultCache(cache);
+
+      setResult(resultWithTime);
+      setHistory((prev) => [{ ...resultWithTime, image }, ...prev]);
+      setRelayNotice("Analysis complete.");
+    } catch (err) {
+      console.error("Analysis failed:", err);
+      if (err instanceof Error) {
+        if (err.message.toLowerCase().includes("api key not valid")) {
+          setError("Your Gemini API key is invalid. Update .env.local with a valid key, then restart npm run dev.");
+        } else {
+          setError(err.message);
+        }
+      } else {
+        setError("Analysis failed. Please try again with a clearer image.");
+      }
+    } finally {
+      setIsAnalyzing(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (isMobileDevice || !relaySessionIdRef.current) return;
+
+    const intervalId = window.setInterval(async () => {
+      try {
+        const response = await fetch(`/api/relay/${relaySessionIdRef.current}?take=1`);
+        if (!response.ok) return;
+        const payload = (await response.json()) as { image?: string | null };
+        if (!payload.image) return;
+
+        setCapturedImage(payload.image);
+        setUploadedFileName("Photo from mobile session");
+        setResult(null);
+        setRelayNotice("Photo received. Running analysis...");
+        await analyzeCapturedImage(payload.image);
+      } catch {
+        // Keep polling; intermittent fetch failures are expected on local networks.
+      }
+    }, RELAY_POLL_MS);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [analyzeCapturedImage, isMobileDevice]);
+
+  const sendCaptureToRelay = async () => {
+    if (!capturedImage || !relaySessionFromUrl) return;
+
+    setIsSendingToRelay(true);
+    setError(null);
+
+    try {
+      const response = await fetch(`/api/relay/${relaySessionFromUrl}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ image: capturedImage }),
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to send photo to SolarGuard relay.");
+      }
+
+      setRelayNotice("Photo sent to desktop SolarGuard. Check your computer for results.");
+    } catch (err) {
+      if (err instanceof Error) {
+        setError(err.message);
+      } else {
+        setError("Could not send photo to SolarGuard relay.");
+      }
+    } finally {
+      setIsSendingToRelay(false);
+    }
+  };
+
   const deleteHistoryItem = (id: string) => {
     setHistory(prev => prev.filter(item => item.id !== id));
   };
@@ -372,6 +638,17 @@ export default function App() {
   const clearAllHistory = () => {
     setHistory([]);
     setExpandedHistoryId(null);
+  };
+
+  const copyMobileUrl = async () => {
+    if (!trimmedMobileAccessUrl) return;
+    try {
+      await navigator.clipboard.writeText(trimmedMobileAccessUrl);
+      setCopiedMobileUrl(true);
+      window.setTimeout(() => setCopiedMobileUrl(false), 1600);
+    } catch {
+      setError("Could not copy the mobile URL. Please copy it manually.");
+    }
   };
 
   const getSeverityColor = (severity: string) => {
@@ -423,40 +700,187 @@ export default function App() {
       <main className="max-w-4xl mx-auto p-6">
         {view === "camera" ? (
           <div className="space-y-6">
+            {!isMobileDevice && (
+              <div className="bg-white p-5 rounded-3xl border border-gray-100 shadow-sm space-y-4">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-2xl bg-emerald-50 text-emerald-600 flex items-center justify-center">
+                    <QrCode className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h2 className="text-base font-bold text-gray-900">Open Camera On Mobile</h2>
+                    <p className="text-xs text-gray-500">Scan this QR code on your phone to open SolarGuard and capture a photo there.</p>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-[auto_1fr] gap-4 items-center">
+                  <div className="w-[180px] h-[180px] rounded-2xl border border-gray-200 bg-gray-50 flex items-center justify-center overflow-hidden">
+                    {qrCodeDataUrl ? (
+                      <img src={qrCodeDataUrl} alt="Mobile access QR code" className="w-full h-full object-cover" />
+                    ) : (
+                      <div className="text-xs text-gray-400 text-center px-4">Enter a valid URL to generate QR code</div>
+                    )}
+                  </div>
+
+                  <div className="space-y-3">
+                    <label className="text-xs font-bold uppercase tracking-wider text-gray-500 flex items-center gap-1.5">
+                      <LinkIcon className="w-3.5 h-3.5" />
+                      Mobile Access URL
+                    </label>
+                    <div className="flex flex-col sm:flex-row gap-2">
+                      <input
+                        type="url"
+                        value={mobileAccessUrl}
+                        onChange={(e) => setMobileAccessUrl(e.target.value)}
+                        placeholder="https://192.168.1.10:3001"
+                        className="w-full px-3 py-2.5 rounded-xl border border-gray-200 bg-white text-sm text-gray-800 focus:outline-none focus:ring-2 focus:ring-emerald-200 focus:border-emerald-400"
+                      />
+                      <button
+                        onClick={copyMobileUrl}
+                        disabled={!hasMobileAccessUrl}
+                        className="px-4 py-2.5 rounded-xl text-sm font-semibold bg-gray-900 text-white hover:bg-black transition-colors flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {copiedMobileUrl ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                        {copiedMobileUrl ? "Copied" : "Copy URL"}
+                      </button>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                      <span className="px-2 py-1 rounded-full bg-gray-100 text-gray-700 font-medium">1. Copy URL</span>
+                      <span className="px-2 py-1 rounded-full bg-gray-100 text-gray-700 font-medium">2. Open on phone</span>
+                      <span className="px-2 py-1 rounded-full bg-gray-100 text-gray-700 font-medium">3. Capture photo</span>
+                    </div>
+                    {hasMobileAccessUrl && isHttpMobileAccessUrl && (
+                      <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2">
+                        HTTP link detected. On many phones, camera access works best over HTTPS.
+                      </p>
+                    )}
+                    {hasMobileAccessUrl && isHttpsMobileAccessUrl && (
+                      <p className="text-xs text-emerald-800 bg-emerald-50 border border-emerald-100 rounded-xl px-3 py-2">
+                        Secure HTTPS link ready for phone camera access.
+                      </p>
+                    )}
+                    <p className="text-xs text-gray-500 flex items-start gap-1.5">
+                      <Smartphone className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+                      {isLocalhost
+                        ? "Use your network URL (example: https://192.168.x.x:3001) so your phone can reach this app."
+                        : "Keep your phone and computer on the same Wi-Fi network for the fastest camera handoff."}
+                    </p>
+                    <p className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-100 rounded-xl px-3 py-2">
+                      {relayNotice}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {isMobileRelayClient && (
+              <div className="bg-emerald-50 border border-emerald-100 rounded-2xl px-4 py-3 text-xs text-emerald-800">
+                {relayNotice}
+              </div>
+            )}
+
+            {isMobileDevice && !isSecureCameraContext && (
+              <div className="bg-amber-50 border border-amber-200 rounded-2xl px-4 py-3 text-xs text-amber-900 space-y-2">
+                <p className="font-semibold">Phone camera is blocked on non-HTTPS pages.</p>
+                <p>Open this secure URL on your phone and accept the certificate warning once:</p>
+                {suggestedHttpsUrl && (
+                  <a
+                    href={suggestedHttpsUrl}
+                    className="text-amber-700 underline break-all"
+                  >
+                    {suggestedHttpsUrl}
+                  </a>
+                )}
+              </div>
+            )}
+
+            <div className="bg-white p-5 rounded-3xl border border-gray-100 shadow-sm space-y-3">
+              <div className="flex items-center gap-2">
+                <Upload className="w-4 h-4 text-emerald-600" />
+                <h3 className="text-sm font-bold text-gray-900">Upload Photo</h3>
+              </div>
+              <p className="text-xs text-gray-500">
+                Select a solar panel photo from your device and run analysis.
+              </p>
+              <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                <label className="inline-flex items-center justify-center px-4 py-2.5 rounded-xl text-sm font-semibold bg-emerald-600 text-white hover:bg-emerald-700 transition-colors cursor-pointer">
+                  Choose Photo
+                  <input type="file" accept="image/*" className="hidden" onChange={handleFileUpload} />
+                </label>
+                <p className="text-xs text-gray-500 truncate">
+                  {uploadedFileName ? `Selected: ${uploadedFileName}` : "No photo selected yet"}
+                </p>
+              </div>
+            </div>
+
             {/* Camera Viewport */}
             <div className="relative aspect-[4/3] bg-black rounded-3xl overflow-hidden shadow-2xl border-4 border-white">
               {!capturedImage ? (
                 <>
-                  <video 
-                    ref={videoRef} 
-                    autoPlay 
-                    playsInline 
-                    className="w-full h-full object-cover"
-                  />
-                  {/* Overlay UI */}
-                  <div className="absolute inset-0 pointer-events-none flex flex-center items-center justify-center">
-                    <div className="w-64 h-64 border-2 border-white/30 rounded-2xl relative">
-                      <div className="absolute top-0 left-0 w-8 h-8 border-t-4 border-l-4 border-emerald-500 rounded-tl-lg"></div>
-                      <div className="absolute top-0 right-0 w-8 h-8 border-t-4 border-r-4 border-emerald-500 rounded-tr-lg"></div>
-                      <div className="absolute bottom-0 left-0 w-8 h-8 border-b-4 border-l-4 border-emerald-500 rounded-bl-lg"></div>
-                      <div className="absolute bottom-0 right-0 w-8 h-8 border-b-4 border-r-4 border-emerald-500 rounded-br-lg"></div>
-                    </div>
-                  </div>
-                  <div className="absolute bottom-8 left-0 right-0 flex justify-center items-center gap-6 px-8">
-                    <label className="p-4 bg-white rounded-full text-emerald-700 border-2 border-emerald-200 shadow-lg cursor-pointer hover:bg-emerald-600 hover:text-white transition-colors">
-                      <Upload className="w-6 h-6" />
-                      <input type="file" accept="image/*" className="hidden" onChange={handleFileUpload} />
-                    </label>
-                    <button 
-                      onClick={capturePhoto}
-                      className="w-20 h-20 bg-white rounded-full flex items-center justify-center border-8 border-emerald-500/30 hover:scale-105 active:scale-95 transition-all"
-                    >
-                      <div className="w-14 h-14 bg-emerald-500 rounded-full flex items-center justify-center">
-                        <Camera className="text-white w-8 h-8" />
+                  {!isMobileDevice ? (
+                    <div className="absolute inset-0 bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900 flex items-center justify-center p-8">
+                      <div className="max-w-md text-center text-white space-y-3">
+                        <Smartphone className="w-12 h-12 mx-auto text-emerald-400" />
+                        <h3 className="text-xl font-bold">Desktop Camera Disabled</h3>
+                        <p className="text-sm text-gray-200">
+                          Camera turns on automatically on mobile phone. Scan the QR code above and capture from your phone.
+                        </p>
                       </div>
-                    </button>
-                    <div className="w-14 h-14" /> {/* Spacer */}
-                  </div>
+                    </div>
+                  ) : stream ? (
+                    <video
+                      ref={videoRef}
+                      autoPlay
+                      playsInline
+                      muted
+                      className="w-full h-full object-cover"
+                    />
+                  ) : (
+                    <div className="absolute inset-0 bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900 flex items-center justify-center p-8">
+                      <div className="max-w-md text-center text-white space-y-3">
+                        <Camera className="w-12 h-12 mx-auto text-emerald-400" />
+                        <h3 className="text-xl font-bold">Starting Mobile Camera</h3>
+                        <p className="text-sm text-gray-200">
+                          Allow camera permission when prompted. SolarGuard will open your phone camera automatically.
+                        </p>
+                        <button
+                          onClick={startCamera}
+                          className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-emerald-500 text-white font-semibold hover:bg-emerald-600 transition-colors"
+                        >
+                          <Camera className="w-4 h-4" />
+                          Start Camera
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {isMobileDevice && stream && (
+                    <>
+                      {/* Overlay UI */}
+                      <div className="absolute inset-0 pointer-events-none flex flex-center items-center justify-center">
+                        <div className="w-64 h-64 border-2 border-white/30 rounded-2xl relative">
+                          <div className="absolute top-0 left-0 w-8 h-8 border-t-4 border-l-4 border-emerald-500 rounded-tl-lg"></div>
+                          <div className="absolute top-0 right-0 w-8 h-8 border-t-4 border-r-4 border-emerald-500 rounded-tr-lg"></div>
+                          <div className="absolute bottom-0 left-0 w-8 h-8 border-b-4 border-l-4 border-emerald-500 rounded-bl-lg"></div>
+                          <div className="absolute bottom-0 right-0 w-8 h-8 border-b-4 border-r-4 border-emerald-500 rounded-br-lg"></div>
+                        </div>
+                      </div>
+                      <div className="absolute bottom-8 left-0 right-0 flex justify-center items-center gap-6 px-8">
+                        <label className="p-4 bg-white rounded-full text-emerald-700 border-2 border-emerald-200 shadow-lg cursor-pointer hover:bg-emerald-600 hover:text-white transition-colors">
+                          <Upload className="w-6 h-6" />
+                          <input type="file" accept="image/*" className="hidden" onChange={handleFileUpload} />
+                        </label>
+                        <button
+                          onClick={capturePhoto}
+                          className="w-20 h-20 bg-white rounded-full flex items-center justify-center border-8 border-emerald-500/30 hover:scale-105 active:scale-95 transition-all"
+                        >
+                          <div className="w-14 h-14 bg-emerald-500 rounded-full flex items-center justify-center">
+                            <Camera className="text-white w-8 h-8" />
+                          </div>
+                        </button>
+                        <div className="w-14 h-14" />
+                      </div>
+                    </>
+                  )}
                 </>
               ) : (
                 <div className="relative w-full h-full">
@@ -464,6 +888,15 @@ export default function App() {
                   <div className="absolute inset-0 bg-black/40 flex items-center justify-center">
                     {!isAnalyzing && !result && (
                       <div className="flex flex-col items-center gap-4">
+                        {isMobileRelayClient && (
+                          <button
+                            onClick={sendCaptureToRelay}
+                            disabled={isSendingToRelay}
+                            className="px-8 py-3 bg-gray-900 text-white rounded-2xl font-bold hover:bg-black transition-all disabled:opacity-70"
+                          >
+                            {isSendingToRelay ? "Sending Photo..." : "Send to SolarGuard"}
+                          </button>
+                        )}
                         <button 
                           onClick={runAnalysis}
                           className="px-8 py-4 bg-emerald-500 text-white rounded-2xl font-bold shadow-xl shadow-emerald-500/20 hover:bg-emerald-600 transition-all flex items-center gap-2"
@@ -543,12 +976,12 @@ export default function App() {
                           initial={{ opacity: 0, scale: 0.95 }}
                           animate={{ opacity: 1, scale: 1 }}
                           transition={{ delay: idx * 0.1 }}
-                          className="bg-white p-5 rounded-3xl border border-gray-100 shadow-sm space-y-4"
+                          className={`bg-white rounded-3xl border border-gray-100 shadow-sm space-y-4 ${defect.type === "crack" ? "p-6 md:col-span-2" : "p-5"}`}
                         >
                           <div className="flex items-center justify-between">
                             <div className="flex items-center gap-2">
-                              <div className={`p-2 rounded-xl ${getSeverityColor(defect.severity)}`}>
-                                {defect.type === "crack" && <ShieldAlert className="w-5 h-5" />}
+                              <div className={`${defect.type === "crack" ? "p-3 rounded-2xl" : "p-2 rounded-xl"} ${getSeverityColor(defect.severity)}`}>
+                                {defect.type === "crack" && <ShieldAlert className="w-6 h-6" />}
                                 {defect.type === "dust" && <Wind className="w-5 h-5" />}
                                 {defect.type === "hotspot" && <Zap className="w-5 h-5" />}
                                 {defect.type === "shading" && <Sun className="w-5 h-5" />}
@@ -556,7 +989,7 @@ export default function App() {
                                 {defect.type === "corrosion" && <Droplets className="w-5 h-5" />}
                                 {defect.type === "none" && <CheckCircle2 className="w-5 h-5" />}
                               </div>
-                              <span className="font-bold capitalize">{defect.type.replace("_", " ")}</span>
+                              <span className={`${defect.type === "crack" ? "text-lg" : ""} font-bold capitalize`}>{defect.type.replace("_", " ")}</span>
                             </div>
                             <span className={`px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider border ${getSeverityColor(defect.severity)}`}>
                               {defect.severity}
@@ -656,7 +1089,7 @@ export default function App() {
                         {item.defects.length > 0 && (
                           <button
                             onClick={() => setExpandedHistoryId(prev => (prev === item.id ? null : item.id))}
-                            className="px-3 py-1.5 text-xs font-bold text-emerald-700 hover:text-emerald-800 bg-emerald-50 hover:bg-emerald-100 rounded-full transition-colors"
+                            className="px-4 py-2 text-sm font-bold text-emerald-700 hover:text-emerald-800 bg-emerald-50 hover:bg-emerald-100 rounded-full transition-colors"
                           >
                             {expandedHistoryId === item.id ? "Hide Problems" : "View Problems"}
                           </button>
@@ -672,20 +1105,20 @@ export default function App() {
                     </div>
 
                     {expandedHistoryId === item.id && item.defects.length > 0 && (
-                      <div className="mt-4 pt-4 border-t border-gray-100 space-y-3">
-                        <p className="text-xs font-bold uppercase tracking-wider text-gray-400">Detected Problems</p>
+                      <div className="mt-5 pt-5 border-t border-gray-100 space-y-4">
+                        <p className="text-sm font-bold uppercase tracking-wider text-gray-500">Detected Problems</p>
                         {item.defects.map((defect, defectIdx) => (
-                          <div key={`${item.id}-problem-${defectIdx}`} className="rounded-2xl border border-gray-100 bg-gray-50 p-3">
+                          <div key={`${item.id}-problem-${defectIdx}`} className="rounded-2xl border border-gray-100 bg-gray-50 p-4 md:p-5">
                             <div className="flex items-center justify-between gap-2">
-                              <p className="text-sm font-bold capitalize text-gray-800">{defect.type.replace("_", " ")}</p>
-                              <span className={`px-2 py-1 rounded-full text-[10px] font-bold uppercase tracking-wide border ${getSeverityColor(defect.severity)}`}>
+                              <p className="text-base font-bold capitalize text-gray-800">{defect.type.replace("_", " ")}</p>
+                              <span className={`px-3 py-1.5 rounded-full text-xs font-bold uppercase tracking-wide border ${getSeverityColor(defect.severity)}`}>
                                 {defect.severity}
                               </span>
                             </div>
-                            <p className="text-xs text-gray-600 mt-2">{defect.description}</p>
-                            <p className="text-xs text-emerald-700 mt-2"><span className="font-semibold">Recommendation:</span> {defect.recommendation}</p>
+                            <p className="text-sm text-gray-600 mt-2.5">{defect.description}</p>
+                            <p className="text-sm text-emerald-700 mt-2.5"><span className="font-semibold">Recommendation:</span> {defect.recommendation}</p>
                             {defect.location_on_panel && (
-                              <p className="text-[11px] text-gray-500 mt-2">Location: {defect.location_on_panel}</p>
+                              <p className="text-xs text-gray-500 mt-2.5">Location: {defect.location_on_panel}</p>
                             )}
                           </div>
                         ))}
